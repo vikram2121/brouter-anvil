@@ -1,0 +1,25 @@
+# Binaries (root only, not cmd/anvil/)
+/anvil
+*.exe
+
+# Data
+*.db
+*.ldb
+data/
+
+# Docs (local only, never committed)
+docs/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Config with secrets
+anvil.toml
+
+# Test
+coverage.out
