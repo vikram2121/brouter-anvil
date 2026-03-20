@@ -24,7 +24,7 @@ func TestJungleBusOnTransaction(t *testing.T) {
 	key, _ := ec.PrivateKeyFromWif("KwDiBf89QgGbjEhKnhXJuH7LrciVrZi3qYjgd9M7rFU74sHUHy8S")
 
 	// Build a SHIP token script
-	shipScript, _, err := brc.BuildSHIPScript(key, "jb-peer.example.com:8333", "foundry:mainnet")
+	shipScript, _, err := brc.BuildSHIPScript(key, "jb-peer.example.com:8333", "anvil:mainnet")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,7 +55,7 @@ func TestJungleBusOnTransaction(t *testing.T) {
 	})
 
 	// The SHIP token should now be in the directory
-	peers, err := dir.LookupSHIPByTopic("foundry:mainnet")
+	peers, err := dir.LookupSHIPByTopic("anvil:mainnet")
 	if err != nil {
 		t.Fatal(err)
 	}
