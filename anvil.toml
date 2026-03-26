@@ -1,0 +1,74 @@
+# Anvil configuration
+# Most settings have sensible defaults. The only required setting is identity.wif,
+# which should be set via ANVIL_IDENTITY_WIF env var (not in this file).
+
+[node]
+name = "brouter"
+data_dir = "/Users/VNRai/.openclaw/workspace/Anvil/data"
+listen = "0.0.0.0:8333"          # mesh peers — wss:// when TLS configured
+api_listen = "0.0.0.0:9333"      # REST API — HTTPS when TLS configured
+public_url = "https://anvil-node-production-9909.up.railway.app"  # API — discoverable externally
+mesh_public_url = "wss://anvil-node-production-9909.up.railway.app" # WebSocket mesh peering
+
+[identity]
+# wif = ""                       # Set via ANVIL_IDENTITY_WIF env var, not here
+
+[mesh]
+seeds = [
+  # "wss://peer1.example.com:8333",
+]
+
+[bsv]
+nodes = ["seed.bitcoinsv.io:8333"]
+
+# ARC — GorillaPool is the default (free, no API key required)
+[arc]
+enabled = true
+url = "https://arc.gorillapool.io"
+# TAAL failover (recommended but not required — set ANVIL_TAAL_API_KEY env var)
+# taal_enabled = false
+# taal_url = "https://arc.taal.com"
+
+# JungleBus — GorillaPool (free, enabled by default for SHIP/SLAP discovery)
+[junglebus]
+enabled = true
+url = "junglebus.gorillapool.io"
+# subscriptions = [
+#   { id = "sub_abc123", name = "ship-tokens", from_block = 800000 },
+# ]
+
+[overlay]
+enabled = true
+topics = ["anvil:mainnet"]
+
+[envelopes]
+max_ephemeral_ttl = 3600
+max_durable_size = 65536
+max_durable_store_mb = 10240
+warn_at_percent = 80
+
+[api]
+# auth_token is auto-derived from identity.wif — you don't need to set it.
+# If you want a custom token, set it here (overrides the derived one).
+# auth_token = ""
+tls_cert = ""                     # path to TLS cert (or use reverse proxy)
+tls_key = ""                      # path to TLS key
+rate_limit = 100                  # requests/second per IP for open reads
+trust_proxy = false               # set true behind nginx/caddy
+payment_satoshis = 0              # x402 price per request (0 = free, experimental)
+
+# Non-custodial app payment models.
+# These control which payment flows third-party apps can use.
+# All are safe by default — the node never holds or forwards funds.
+# See docs/NON_CUSTODIAL_PAYMENT_POLICY.md for the full policy.
+[api.app_payments]
+allow_passthrough = true          # Model 2: app sets its own payee script
+allow_split = true                # Model 3: atomic dual-pay (node + app)
+allow_token_gating = true         # Model 4: credential-based access (no payment)
+max_app_price_sats = 10000        # cap on app-declared prices (0 = no cap)
+
+# HARDCODED PROHIBITIONS (not configurable — no code path exists):
+# - receive_and_forward = PROHIBITED (money transmission)
+# - hold_on_behalf = PROHIBITED (custodial)
+# - revenue_share_via_wallet = PROHIBITED (money transmission)
+# deployed Thu Mar 26 19:27:04 GMT 2026
