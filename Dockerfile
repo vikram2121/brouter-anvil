@@ -12,7 +12,6 @@ COPY anvil.toml ./anvil.toml
 # Overwrite data_dir to use Railway volume mount
 RUN sed -i 's|data_dir = .*|data_dir = "/data"|' anvil.toml
 
-VOLUME ["/data"]
 EXPOSE 8333 9333
 
 CMD ["sh", "-c", "./anvil -config anvil.toml"]
