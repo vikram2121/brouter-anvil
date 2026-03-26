@@ -7,11 +7,11 @@ FROM alpine:3.19
 RUN apk add --no-cache ca-certificates
 WORKDIR /app
 COPY --from=builder /src/anvil ./anvil
-COPY anvil.toml ./anvil.toml
 
-# Overwrite data_dir to use Railway volume mount
-RUN sed -i 's|data_dir = .*|data_dir = "/data"|' anvil.toml
+# Startup script: generate anvil.toml from env vars at runtime
+COPY docker-entrypoint.sh ./docker-entrypoint.sh
+RUN chmod +x ./docker-entrypoint.sh
 
 EXPOSE 8333 9333
 
-CMD ["sh", "-c", "./anvil -config anvil.toml"]
+ENTRYPOINT ["./docker-entrypoint.sh"]
