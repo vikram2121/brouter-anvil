@@ -15,8 +15,8 @@ name = "${NODE_NAME}"
 data_dir = "${DATA_DIR}"
 listen = "0.0.0.0:8333"
 api_listen = "0.0.0.0:${API_PORT}"
-${PUBLIC_URL:+public_url = "${PUBLIC_URL}"}
-${MESH_URL:+mesh_public_url = "${MESH_URL}"}
+public_url = "${PUBLIC_URL}"
+mesh_public_url = "${MESH_URL}"
 
 [identity]
 # wif set via ANVIL_IDENTITY_WIF env var
