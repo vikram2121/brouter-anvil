@@ -151,6 +151,24 @@ func (s *Scanner) ScanAddress(ctx context.Context, address string) (*ScanResult,
 			continue
 		}
 
+		// Parse transaction to get canonical TxID hash
+		txBytesRaw, txParseErr := hex.DecodeString(rawTxHex)
+		if txParseErr != nil {
+			detail.Status = "error"
+			detail.Error = fmt.Sprintf("decode raw tx: %v", txParseErr)
+			result.Errors++
+			result.Details = append(result.Details, detail)
+			continue
+		}
+		parsedTx, txParseErr := transaction.NewTransactionFromBytes(txBytesRaw)
+		if txParseErr != nil {
+			detail.Status = "error"
+			detail.Error = fmt.Sprintf("parse tx: %v", txParseErr)
+			result.Errors++
+			result.Details = append(result.Details, detail)
+			continue
+		}
+
 		// Fetch merkle proof (tries ARC then WoC TSC fallback)
 		merkleHex, err := s.fetchMerkleProof(utxo.TxHash, uint32(utxo.Height))
 		if err != nil {
@@ -161,8 +179,8 @@ func (s *Scanner) ScanAddress(ctx context.Context, address string) (*ScanResult,
 			continue
 		}
 
-		// Build BEEF from raw tx + merkle path
-		beefBytes, err := buildBEEF(rawTxHex, merkleHex)
+		// Build BEEF from parsed tx + merkle path
+		beefBytes, err := buildBEEFFromTx(parsedTx, merkleHex)
 		if err != nil {
 			detail.Status = "error"
 			detail.Error = fmt.Sprintf("build BEEF: %v", err)
@@ -171,33 +189,46 @@ func (s *Scanner) ScanAddress(ctx context.Context, address string) (*ScanResult,
 			continue
 		}
 
-		// Internalize into the wallet via "basket insertion" protocol.
-		// We use basket insertion (not "wallet payment") because externally-received
-		// funds weren't sent via BRC-29 — the wallet can't re-derive the locking
-		// script from payment remittance params. Basket insertion stores the output
-		// as spendable without derivation verification.
-		_, err = s.inner.InternalizeAction(ctx, sdk.InternalizeActionArgs{
-			Tx: beefBytes,
-			Outputs: []sdk.InternalizeOutput{
+		// Import the P2PKH UTXO into the wallet using createAction + signAction.
+		// This mirrors wallet-toolbox's fundWalletFromP2PKHOutpoints approach:
+		// pass the external BEEF as inputBEEF and spend the UTXO in one step,
+		// rather than internalizing first (which fails to register proof chains).
+		outpoint := transaction.Outpoint{Txid: *parsedTx.TxID(), Index: utxo.TxPos}
+		trustSelf := sdk.TrustSelf("known")
+		car, err := s.inner.CreateAction(ctx, sdk.CreateActionArgs{
+			Description: fmt.Sprintf("Import P2PKH UTXO %s:%d", utxo.TxHash[:16], utxo.TxPos),
+			InputBEEF:   beefBytes,
+			Inputs: []sdk.CreateActionInput{
 				{
-					OutputIndex: utxo.TxPos,
-					Protocol:    "basket insertion",
-					InsertionRemittance: &sdk.BasketInsertion{
-						Basket:             "default",
-						CustomInstructions: fmt.Sprintf("scanned:%s:%d", utxo.TxHash, utxo.TxPos),
-						Tags:               []string{"scanned"},
-					},
+					Outpoint:              outpoint,
+					InputDescription:      "fund wallet from P2PKH",
+					UnlockingScriptLength: 108, // standard P2PKH unlock size
 				},
 			},
-			Description: fmt.Sprintf("scanned UTXO %s:%d (%d sats)",
-				utxo.TxHash, utxo.TxPos, utxo.Value),
+			Labels: []string{"p2pkh-funding"},
+			Options: &sdk.CreateActionOptions{
+				TrustSelf: trustSelf,
+			},
 		}, "anvil-scanner")
 		if err != nil {
 			detail.Status = "error"
-			detail.Error = fmt.Sprintf("internalize: %v", err)
+			detail.Error = fmt.Sprintf("create action: %v", err)
 			result.Errors++
 			result.Details = append(result.Details, detail)
 			continue
+		}
+
+		// If wallet auto-signed (no signableTransaction), we're done.
+		// Otherwise, sign the P2PKH input and complete via signAction.
+		if car.SignableTransaction != nil {
+			err = s.signAndComplete(ctx, car, parsedTx, utxo)
+			if err != nil {
+				detail.Status = "error"
+				detail.Error = fmt.Sprintf("sign action: %v", err)
+				result.Errors++
+				result.Details = append(result.Details, detail)
+				continue
+			}
 		}
 
 		detail.Status = "internalized"
@@ -221,6 +252,61 @@ func (s *Scanner) ScanAddress(ctx context.Context, address string) (*ScanResult,
 	)
 
 	return result, nil
+}
+
+// signAndComplete signs the P2PKH input in a signable transaction and completes
+// the action via SignAction. This handles the case where createAction returns
+// a signable transaction instead of auto-signing.
+func (s *Scanner) signAndComplete(ctx context.Context, car *sdk.CreateActionResult, parsedTx *transaction.Transaction, utxo wocUTXO) error {
+	st := car.SignableTransaction
+
+	// Find our input in the signable transaction
+	// SignableTransaction.Tx is BEEF format, not raw tx bytes
+	stTx := &transaction.Transaction{}
+	if err := stTx.FromBEEF(st.Tx); err != nil {
+		return fmt.Errorf("parse signable tx from BEEF: %w", err)
+	}
+
+	inputIndex := -1
+	for i, inp := range stTx.Inputs {
+		if inp.SourceTXID != nil && inp.SourceTXID.Equal(*parsedTx.TxID()) && inp.SourceTxOutIndex == utxo.TxPos {
+			inputIndex = i
+			break
+		}
+	}
+	if inputIndex < 0 {
+		return fmt.Errorf("could not find outpoint in signable transaction inputs")
+	}
+
+	// Sign the P2PKH input
+	satoshis := parsedTx.Outputs[utxo.TxPos].Satoshis
+	unlock, err := p2pkh.Unlock(s.identityKey, nil)
+	if err != nil {
+		return fmt.Errorf("create unlock template: %w", err)
+	}
+	stTx.Inputs[inputIndex].UnlockingScriptTemplate = unlock
+	stTx.Inputs[inputIndex].SourceTransaction = parsedTx
+	if err := stTx.Sign(); err != nil {
+		return fmt.Errorf("sign: %w", err)
+	}
+	_ = satoshis // used implicitly by the unlock template via SourceTransaction
+
+	unlockScript := stTx.Inputs[inputIndex].UnlockingScript.Bytes()
+
+	// Complete via SignAction
+	spends := make(map[uint32]sdk.SignActionSpend)
+	spends[uint32(inputIndex)] = sdk.SignActionSpend{
+		UnlockingScript: unlockScript,
+	}
+	_, err = s.inner.SignAction(ctx, sdk.SignActionArgs{
+		Reference: st.Reference,
+		Spends:    spends,
+	}, "anvil-scanner")
+	if err != nil {
+		return fmt.Errorf("sign action: %w", err)
+	}
+
+	return nil
 }
 
 // buildKnownSet returns a set of "txid:vout" strings for outputs the wallet
@@ -352,14 +438,15 @@ func (s *Scanner) fetchMerkleProofFromWoC(txid string, blockHeight uint32) (stri
 	path := make([][]*transaction.PathElement, treeHeight)
 	offset := proof.Index
 
+	// Derive the canonical txid hash from the raw transaction bytes.
+	// We must NOT use proof.TxOrID decoded from hex — the go-sdk's chainhash
+	// internal byte order differs from manual hex decode + reverse.
+	txidHash, _ := chainhash.NewHashFromHex(proof.TxOrID)
+
 	for level := 0; level < treeHeight; level++ {
 		sibOffset := offset ^ 1
 
 		if level == 0 {
-			// Level 0: tx leaf + its sibling
-			txBytes, _ := hex.DecodeString(proof.TxOrID)
-			reverseBytes(txBytes) // display → natural
-			txHash, _ := chainhash.NewHash(txBytes)
 			isTrue := true
 
 			var elements []*transaction.PathElement
@@ -367,13 +454,13 @@ func (s *Scanner) fetchMerkleProofFromWoC(txid string, blockHeight uint32) (stri
 			// Add both in offset order (lower first)
 			if offset < sibOffset {
 				elements = append(elements, &transaction.PathElement{
-					Offset: offset, Hash: txHash, Txid: &isTrue,
+					Offset: offset, Hash: txidHash, Txid: &isTrue,
 				})
 				elements = append(elements, tscNodeToElement(proof.Nodes[0], sibOffset))
 			} else {
 				elements = append(elements, tscNodeToElement(proof.Nodes[0], sibOffset))
 				elements = append(elements, &transaction.PathElement{
-					Offset: offset, Hash: txHash, Txid: &isTrue,
+					Offset: offset, Hash: txidHash, Txid: &isTrue,
 				})
 			}
 			path[0] = elements
@@ -410,19 +497,9 @@ func reverseBytes(b []byte) {
 	}
 }
 
-// buildBEEF constructs Atomic BEEF from a raw tx hex and BRC-74 merkle path hex.
-// Atomic BEEF = version(0x01010101) + txid(32 bytes) + BEEF V2 bytes.
-// This is the format go-wallet-toolbox's InternalizeAction expects.
-func buildBEEF(rawTxHex, merklePathHex string) ([]byte, error) {
-	txBytes, err := hex.DecodeString(rawTxHex)
-	if err != nil {
-		return nil, fmt.Errorf("decode raw tx hex: %w", err)
-	}
-	tx, err := transaction.NewTransactionFromBytes(txBytes)
-	if err != nil {
-		return nil, fmt.Errorf("parse transaction: %w", err)
-	}
-
+// buildBEEFFromTx constructs Atomic BEEF from an already-parsed transaction
+// and a BRC-74 merkle path hex string.
+func buildBEEFFromTx(tx *transaction.Transaction, merklePathHex string) ([]byte, error) {
 	mp, err := transaction.NewMerklePathFromHex(merklePathHex)
 	if err != nil {
 		return nil, fmt.Errorf("parse merkle path: %w", err)
@@ -430,7 +507,6 @@ func buildBEEF(rawTxHex, merklePathHex string) ([]byte, error) {
 
 	tx.MerklePath = mp
 
-	// Build a Beef V2 struct and serialize as Atomic BEEF
 	beef, err := transaction.NewBeefFromTransaction(tx)
 	if err != nil {
 		return nil, fmt.Errorf("build beef from tx: %w", err)

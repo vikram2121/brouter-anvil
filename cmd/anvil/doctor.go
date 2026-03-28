@@ -12,14 +12,17 @@ import (
 	"time"
 
 	"github.com/BSVanon/Anvil/internal/config"
+	anvilversion "github.com/BSVanon/Anvil/internal/version"
 )
 
 // cmdDoctor handles `anvil doctor` — validates config, dirs, connectivity, and mesh health.
 // Exits 0 if healthy, 1 if any check fails.
 func cmdDoctor(args []string) {
 	fs := flag.NewFlagSet("doctor", flag.ExitOnError)
-	configPath := fs.String("config", "anvil.toml", "path to config file")
+	configPath := fs.String("config", defaultConfigPath(), "path to config file")
 	fs.Parse(args)
+
+	loadEnvFile(*configPath)
 
 	fmt.Println("=== Anvil Doctor ===")
 	issues := 0
@@ -49,6 +52,20 @@ func cmdDoctor(args []string) {
 		pass("auth token derived (%s...)", cfg.API.AuthToken[:12])
 	}
 
+	// ── 1b. Version ──
+	section("Version")
+	pass("running v%s", anvilversion.Version)
+	if latest := doctorCheckLatest(); latest != "" {
+		latestClean := strings.TrimPrefix(latest, "v")
+		if versionNewerOrEqual(anvilversion.Version, latestClean) {
+			pass("up to date (latest release: %s)", latest)
+		} else {
+			warn("update available: %s → run: sudo anvil upgrade", latest)
+		}
+	} else {
+		warn("could not check GitHub for latest release")
+	}
+
 	// ── 2. Data directories ──
 	section("Data Directories")
 	requiredDirs := []string{"headers", "envelopes", "overlay", "wallet", "invoices", "proofs"}
@@ -76,11 +93,13 @@ func cmdDoctor(args []string) {
 	svcName := guessServiceName(cfg)
 	if svcName != "" {
 		status := serviceStatus(svcName)
-		if strings.Contains(status, "active (running)") {
+		if status == "active" {
 			pass("%s is running", svcName)
-		} else {
-			fail("%s status: %s", svcName, strings.TrimSpace(status))
+		} else if status == "inactive" || status == "failed" {
+			fail("%s is %s — run: sudo systemctl start %s", svcName, status, svcName)
 			issues++
+		} else {
+			warn("%s status: %s", svcName, status)
 		}
 	} else {
 		warn("could not determine systemd service name")
@@ -198,7 +217,7 @@ func cmdDoctor(args []string) {
 					if sats > 0 {
 						pass("wallet balance: %d sats", sats)
 					} else {
-						warn("wallet has 0 sats — fund it for tx broadcast")
+						warn("wallet has 0 sats — run: sudo anvil info  to get your funding address")
 					}
 				}
 			}
@@ -304,10 +323,30 @@ func normalizePort(listen string) string {
 	return ":" + parts[len(parts)-1]
 }
 
+// doctorCheckLatest returns the latest GitHub release tag, or "" on failure.
+func doctorCheckLatest() string {
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(githubAPI)
+	if err != nil || resp.StatusCode != 200 {
+		return ""
+	}
+	defer resp.Body.Close()
+	var release struct {
+		TagName string `json:"tag_name"`
+	}
+	json.NewDecoder(resp.Body).Decode(&release)
+	return release.TagName
+}
+
 func meshSeedToAPI(seed string) string {
+	// wss://anvil.sendbsv.com/mesh → https://anvil.sendbsv.com
 	// ws://127.0.0.1:8333 → http://127.0.0.1:9333
-	s := strings.Replace(seed, "ws://", "http://", 1)
-	s = strings.Replace(s, "wss://", "https://", 1)
+	s := strings.Replace(seed, "wss://", "https://", 1)
+	s = strings.Replace(s, "ws://", "http://", 1)
+	// Strip path (e.g. /mesh)
+	if idx := strings.Index(s[8:], "/"); idx >= 0 {
+		s = s[:8+idx]
+	}
 	s = strings.Replace(s, ":8333", ":9333", 1)
 	s = strings.Replace(s, ":8334", ":9334", 1)
 	return s

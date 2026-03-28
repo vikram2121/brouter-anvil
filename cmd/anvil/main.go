@@ -16,11 +16,12 @@ import (
 
 	"github.com/BSVanon/Anvil/internal/api"
 	"github.com/BSVanon/Anvil/internal/bond"
-	"github.com/BSVanon/Anvil/internal/p2p"
 	"github.com/BSVanon/Anvil/internal/config"
 	"github.com/BSVanon/Anvil/internal/envelope"
+	"github.com/BSVanon/Anvil/internal/feeds"
 	anvilgossip "github.com/BSVanon/Anvil/internal/gossip"
 	"github.com/BSVanon/Anvil/internal/headers"
+	"github.com/BSVanon/Anvil/internal/p2p"
 	anviloverlay "github.com/BSVanon/Anvil/internal/overlay"
 	anvilversion "github.com/BSVanon/Anvil/internal/version"
 	"github.com/BSVanon/Anvil/internal/overlay/topics"
@@ -46,6 +47,15 @@ func main() {
 		case "token":
 			cmdToken(os.Args[2:])
 			return
+		case "info":
+			cmdInfo(os.Args[2:])
+			return
+		case "upgrade":
+			cmdUpgrade(os.Args[2:])
+			return
+		case "help", "--help", "-h":
+			cmdHelp(os.Args[2:])
+			return
 		}
 	}
 
@@ -59,7 +69,7 @@ func main() {
 
 	logger := slog.Default()
 
-	log.Printf("anvil node %q starting", cfg.Node.Name)
+	log.Printf("anvil node %q v%s starting", cfg.Node.Name, anvilversion.Version)
 	log.Printf("  data_dir:   %s", cfg.Node.DataDir)
 	log.Printf("  mesh:       %s", cfg.Node.Listen)
 	log.Printf("  api:        %s", cfg.Node.APIListen)
@@ -70,6 +80,9 @@ func main() {
 	if cfg.API.AuthToken != "" {
 		log.Printf("  auth:       configured (run 'anvil token' to display)")
 	}
+
+	// Background version check — one HTTP call, doesn't block startup
+	go checkForUpdate(logger)
 
 	// Phase 2: Header store + sync
 	headerDir := filepath.Join(cfg.Node.DataDir, "headers")
@@ -281,6 +294,40 @@ func main() {
 					}
 				}
 			}()
+		}
+	}
+
+	// Built-in data feeds: heartbeat + block tip announcements.
+	// These make mesh activity immediately visible to new node operators.
+	// Requires identity key (for signing) + envelope store + gossip manager.
+	if cfg.Identity.WIF != "" && gossipMgr != nil {
+		feedKey, err := ec.PrivateKeyFromWif(cfg.Identity.WIF)
+		if err == nil {
+			pub := feeds.NewPublisher(feedKey, envStore, gossipMgr.BroadcastEnvelope, cfg.Node.Name, anvilversion.Version, logger)
+
+			feedCtx, feedCancel := context.WithCancel(context.Background())
+			defer feedCancel()
+
+			// Heartbeat: every 60s, announces node presence + basic stats
+			go pub.RunHeartbeat(feedCtx, 60*time.Second,
+				headerStore.Tip,
+				gossipMgr.PeerCount,
+				envStore.Topics,
+			)
+
+			// Block tip: polls every 10s, publishes when chain advances
+			go pub.RunBlockTip(feedCtx, 10*time.Second,
+				headerStore.Tip,
+				func(h uint32) string {
+					hash, err := headerStore.HashAtHeight(h)
+					if err != nil || hash == nil {
+						return ""
+					}
+					return hash.String()
+				},
+			)
+
+			log.Printf("feeds: heartbeat (60s) + block tip (10s poll) publishers started")
 		}
 	}
 
