@@ -15,7 +15,7 @@ mesh_public_url = "wss://anvil-node-production-9909.up.railway.app" # WebSocket 
 
 [mesh]
 seeds = [
-  # "wss://peer1.example.com:8333",
+  "wss://anvil.sendbsv.com/mesh",
 ]
 
 [bsv]
