@@ -22,7 +22,7 @@ mesh_public_url = "${MESH_URL}"
 # wif set via ANVIL_IDENTITY_WIF env var
 
 [mesh]
-seeds = []
+seeds = ["wss://anvil.sendbsv.com/mesh"]
 
 [bsv]
 nodes = ["seed.bitcoinsv.io:8333"]
