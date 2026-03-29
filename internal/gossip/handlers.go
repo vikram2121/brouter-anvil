@@ -14,6 +14,25 @@ import (
 	"github.com/BSVanon/Anvil/internal/envelope"
 )
 
+// requestCatchUp asks a peer for recent envelopes on critical topics.
+// Called after connect so new/reconnecting nodes immediately get catalog, feeds, etc.
+func (m *Manager) requestCatchUp(peer *auth.Peer) {
+	if len(m.catchUpTopics) == 0 {
+		return
+	}
+	for _, topic := range m.catchUpTopics {
+		payload, err := Encode(MsgDataRequest, DataRequestPayload{
+			Topic: topic,
+			Limit: 50,
+		})
+		if err != nil {
+			continue
+		}
+		peer.ToPeer(context.Background(), payload, nil, 5000)
+	}
+	m.logger.Debug("catch-up requested", "topics", m.catchUpTopics)
+}
+
 // announceInterests sends our topic declarations to a peer.
 func (m *Manager) announceInterests(peer *auth.Peer) error {
 	payload, err := Encode(MsgTopics, TopicsPayload{Prefixes: m.localInterests})
@@ -50,7 +69,48 @@ func (m *Manager) announceSHIP(peer *auth.Peer) {
 	peer.ToPeer(context.Background(), payload, nil, 5000)
 }
 
+// ReannounceToAll sends this node's own SHIP registrations to all connected peers.
+// Only sends self-registered entries (TxID == "self-registered") to prevent
+// keeping dead remote peers alive by re-gossiping their stale entries.
+// Call periodically to keep LastSeen fresh on remote directories.
+func (m *Manager) ReannounceToAll() {
+	if m.overlayDir == nil {
+		return
+	}
+	var peers []SHIPPeerInfo
+	m.overlayDir.ForEachSHIP(func(identity, domain, nodeName, version, topic string) bool {
+		// Only include entries owned by local pubkeys — skip learned gossip entries
+		if _, isLocal := m.localPubkeys[identity]; isLocal {
+			peers = append(peers, SHIPPeerInfo{
+				IdentityPub: identity,
+				Domain:      domain,
+				NodeName:    nodeName,
+				Version:     version,
+				Topic:       topic,
+			})
+		}
+		return true
+	})
+	if len(peers) == 0 {
+		return
+	}
+	payload, err := Encode(MsgSHIPSync, SHIPSyncPayload{Peers: peers})
+	if err != nil {
+		return
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, mp := range m.peers {
+		if mp.Peer != nil {
+			mp.Peer.ToPeer(context.Background(), payload, mp.IdentityPK, 5000)
+		}
+	}
+}
+
 // onSHIPSync handles SHIP registrations received from a peer.
+// Uses full-replace semantics: for each domain in the incoming sync,
+// the new entry replaces any existing entry for that domain+topic.
+// This ensures restarts and reconnects fully refresh the directory.
 func (m *Manager) onSHIPSync(senderPK string, raw json.RawMessage) error {
 	if m.overlayDir == nil {
 		return nil
@@ -64,10 +124,12 @@ func (m *Manager) onSHIPSync(senderPK string, raw json.RawMessage) error {
 		if p.IdentityPub == "" || p.Domain == "" || p.Topic == "" {
 			continue
 		}
+		// AddSHIPPeerFromGossip handles domain-based dedup internally:
+		// removes any existing entry for the same domain+topic with a
+		// different identity before adding the new one.
 		if err := m.overlayDir.AddSHIPPeerFromGossip(p.IdentityPub, p.Domain, p.NodeName, p.Version, p.Topic); err == nil {
 			added++
 		}
-		// Store version on connected peer if we know them
 		if p.Version != "" {
 			m.mu.Lock()
 			if mp, ok := m.peers[p.IdentityPub]; ok {

@@ -11,6 +11,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -21,6 +23,7 @@ import (
 	"github.com/BSVanon/Anvil/internal/feeds"
 	anvilgossip "github.com/BSVanon/Anvil/internal/gossip"
 	"github.com/BSVanon/Anvil/internal/headers"
+	mempoolpkg "github.com/BSVanon/Anvil/internal/mempool"
 	"github.com/BSVanon/Anvil/internal/p2p"
 	anviloverlay "github.com/BSVanon/Anvil/internal/overlay"
 	anvilversion "github.com/BSVanon/Anvil/internal/version"
@@ -29,6 +32,7 @@ import (
 	"github.com/BSVanon/Anvil/internal/txrelay"
 	anvilwallet "github.com/BSVanon/Anvil/internal/wallet"
 	ec "github.com/bsv-blockchain/go-sdk/primitives/ec"
+	"github.com/libsv/go-p2p/chaincfg/chainhash"
 	bsvscript "github.com/bsv-blockchain/go-sdk/script"
 	"github.com/bsv-blockchain/go-sdk/transaction/template/p2pkh"
 	"github.com/libsv/go-p2p/wire"
@@ -141,6 +145,65 @@ func main() {
 		}
 	}()
 
+	// P2P mempool monitoring (optional — connects to BSV peer, listens for tx inv)
+	var mempoolIdx *mempoolpkg.Index
+	if cfg.Mempool.Enabled && len(cfg.BSV.Nodes) > 0 {
+		mempoolIdx = mempoolpkg.NewIndex()
+
+		// Build coverage map from config prefixes (or default to first 5 bytes)
+		coverage := make(map[byte]struct{})
+		if len(cfg.Mempool.Prefixes) > 0 {
+			for _, p := range cfg.Mempool.Prefixes {
+				if p >= 0 && p <= 255 {
+					coverage[byte(p)] = struct{}{}
+				}
+			}
+		} else {
+			// Default: cover first 5 prefix bytes (~2% of txids)
+			for i := byte(0); i < 5; i++ {
+				coverage[i] = struct{}{}
+			}
+		}
+
+		monitor := p2p.NewMempoolMonitor(
+			cfg.BSV.Nodes[0], wire.MainNet, coverage, cfg.Mempool.MaxTxSize,
+			func(txHash chainhash.Hash, raw []byte) {
+				var id [32]byte
+				copy(id[:], txHash[:])
+				mempoolIdx.Add(id, mempoolpkg.TxMeta{
+					FirstSeen: time.Now(),
+					Size:      uint32(len(raw)),
+				})
+			},
+			logger,
+		)
+
+		monCtx, monCancel := context.WithCancel(context.Background())
+		defer monCancel()
+		if err := monitor.Start(monCtx); err != nil {
+			log.Printf("mempool monitor failed (non-fatal): %v", err)
+		} else {
+			defer monitor.Stop()
+			log.Printf("mempool monitor: connected to %s, coverage=%d prefixes", cfg.BSV.Nodes[0], len(coverage))
+
+			// Periodic eviction
+			go func() {
+				ttl := time.Duration(cfg.Mempool.TTLSeconds) * time.Second
+				if ttl == 0 {
+					ttl = time.Hour
+				}
+				ticker := time.NewTicker(5 * time.Minute)
+				defer ticker.Stop()
+				for range ticker.C {
+					cutoff := time.Now().Add(-ttl)
+					if n := mempoolIdx.ExpireBefore(cutoff); n > 0 {
+						logger.Info("mempool evicted expired entries", "count", n)
+					}
+				}
+			}()
+		}
+	}
+
 	// Phase 6: Overlay directory + generic engine
 	var overlayDir *anviloverlay.Directory
 	var overlayEngine *anviloverlay.Engine
@@ -176,9 +239,29 @@ func main() {
 				if domain == "" {
 					domain = cfg.Node.Listen
 				}
+				identityHex := fmt.Sprintf("%x", identityKey.PubKey().Compressed())
+
+				// Clean stale SHIP entries before self-registering.
+				// Removes expired entries and re-key phantoms.
+				localDomains := map[string]string{domain: identityHex}
+				if cleaned := overlayDir.CleanupOnBoot(localDomains, logger); cleaned > 0 {
+					log.Printf("overlay: cleaned %d stale SHIP entries on boot", cleaned)
+				}
+
 				anviloverlay.Bootstrap(overlayDir, identityKey, domain, cfg.Node.Name, anvilversion.Version, cfg.Overlay.Topics, logger)
 			}
 		}
+
+		// Periodic SHIP entry sweep — prune entries not refreshed within TTL
+		go func() {
+			ticker := time.NewTicker(5 * time.Minute)
+			defer ticker.Stop()
+			for range ticker.C {
+				if n := overlayDir.SweepExpired(); n > 0 {
+					logger.Info("overlay: swept expired SHIP entries", "count", n)
+				}
+			}
+		}()
 
 		// Live discovery: JungleBus subscription for real-time SHIP/SLAP detection
 		if cfg.JungleBus.Enabled {
@@ -220,6 +303,12 @@ func main() {
 		walletDir := filepath.Join(cfg.Node.DataDir, "wallet")
 		nw, err := anvilwallet.New(cfg.Identity.WIF, walletDir, headerStore, proofStore, broadcaster, arcClient, logger)
 		if err != nil {
+			if strings.Contains(err.Error(), "CGO_ENABLED") || strings.Contains(err.Error(), "cgo to work") {
+				log.Fatalf("FATAL: binary was built with CGO_ENABLED=0 but the wallet requires CGO.\n"+
+					"  Rebuild with: CGO_ENABLED=1 go build ./cmd/anvil\n"+
+					"  Or use: make build\n"+
+					"  Error: %v", err)
+			}
 			log.Printf("wallet init failed (non-fatal): %v", err)
 		} else {
 			nodeWallet = nw
@@ -257,9 +346,16 @@ func main() {
 			OverlayDir:     overlayDir,
 			BondChecker:    bondCheck,
 			LocalPubkeys:   localPKs,
-			OnEnvelope: func(env *envelope.Envelope) {
-				logger.Info("mesh envelope received", "topic", env.Topic, "from", env.Pubkey[:16])
-			},
+			CatchUpTopics:  []string{"anvil:catalog", "mesh:heartbeat", "mesh:blocks"},
+			OnEnvelope: func() func(*envelope.Envelope) {
+				var firstData sync.Once
+				return func(env *envelope.Envelope) {
+					firstData.Do(func() {
+						log.Printf("mesh: receiving live data from peers (first: %s)", env.Topic)
+					})
+					logger.Debug("mesh envelope received", "topic", env.Topic, "from", env.Pubkey[:16])
+				}
+			}(),
 		})
 		defer gossipMgr.Stop()
 
@@ -295,6 +391,19 @@ func main() {
 				}
 			}()
 		}
+	}
+
+	// Periodic SHIP re-announcement keeps LastSeen fresh on remote peers.
+	// Without this, long-lived connections get TTL-pruned from remote directories.
+	// Runs at half the TTL interval so entries are always refreshed before expiry.
+	if gossipMgr != nil {
+		go func() {
+			ticker := time.NewTicker(45 * time.Minute)
+			defer ticker.Stop()
+			for range ticker.C {
+				gossipMgr.ReannounceToAll()
+			}
+		}()
 	}
 
 	// Built-in data feeds: heartbeat + block tip announcements.

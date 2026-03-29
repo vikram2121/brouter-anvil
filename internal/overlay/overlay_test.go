@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/BSVanon/Anvil/pkg/brc"
 	ec "github.com/bsv-blockchain/go-sdk/primitives/ec"
@@ -105,6 +106,86 @@ func TestCountSHIP(t *testing.T) {
 	}
 }
 
+// --- TTL + Sweep ---
+
+func TestSweepExpiredEntries(t *testing.T) {
+	d := tmpDirectory(t)
+	d.ttl = 100 * time.Millisecond
+
+	// Add an entry
+	d.AddSHIPPeerFromGossip("aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aa", "node.com", "A", "0.5.0", "anvil:mainnet")
+	if d.CountSHIP() != 1 {
+		t.Fatalf("expected 1, got %d", d.CountSHIP())
+	}
+
+	// Wait for TTL to expire
+	time.Sleep(150 * time.Millisecond)
+
+	swept := d.SweepExpired()
+	if swept != 1 {
+		t.Fatalf("expected 1 swept, got %d", swept)
+	}
+	if d.CountSHIP() != 0 {
+		t.Fatalf("expected 0 after sweep, got %d", d.CountSHIP())
+	}
+}
+
+func TestSweepKeepsFreshEntries(t *testing.T) {
+	d := tmpDirectory(t)
+	d.ttl = 1 * time.Hour
+
+	d.AddSHIPPeerFromGossip("bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bb", "node.com", "B", "0.5.0", "anvil:mainnet")
+
+	swept := d.SweepExpired()
+	if swept != 0 {
+		t.Fatalf("expected 0 swept for fresh entry, got %d", swept)
+	}
+	if d.CountSHIP() != 1 {
+		t.Fatalf("expected 1, got %d", d.CountSHIP())
+	}
+}
+
+func TestCleanupOnBoot(t *testing.T) {
+	d := tmpDirectory(t)
+	d.ttl = 100 * time.Millisecond
+
+	// Add entries: one local (different identity = re-key phantom), one remote
+	d.AddSHIPPeerFromGossip("old_identity_old_identity_old_identity_old_identity_old_identity_00", "local.com", "Local", "0.4.0", "anvil:mainnet")
+	d.AddSHIPPeerFromGossip("remote_identity_remote_identity_remote_identity_remote_identity_00", "remote.com", "Remote", "0.5.0", "anvil:mainnet")
+
+	// Wait for TTL
+	time.Sleep(150 * time.Millisecond)
+
+	// Cleanup: local.com should be cleaned (re-key + expired), remote.com should be cleaned (expired)
+	localDomains := map[string]string{"local.com": "new_identity_new_identity_new_identity_new_identity_new_identity_00"}
+	cleaned := d.CleanupOnBoot(localDomains, nil)
+	if cleaned != 2 {
+		t.Fatalf("expected 2 cleaned, got %d", cleaned)
+	}
+	if d.CountSHIP() != 0 {
+		t.Fatalf("expected 0, got %d", d.CountSHIP())
+	}
+}
+
+func TestCleanupOnBootKeepsFreshRemote(t *testing.T) {
+	d := tmpDirectory(t)
+	d.ttl = 1 * time.Hour
+
+	// Fresh remote entry should survive
+	d.AddSHIPPeerFromGossip("remote_id_remote_id_remote_id_remote_id_remote_id_remote_id_remote", "remote.com", "Remote", "0.5.0", "anvil:mainnet")
+	// Stale local re-key should be cleaned
+	d.AddSHIPPeerFromGossip("old_local_old_local_old_local_old_local_old_local_old_local_old_loc", "local.com", "Local", "0.4.0", "anvil:mainnet")
+
+	localDomains := map[string]string{"local.com": "new_local_new_local_new_local_new_local_new_local_new_local_new_loc"}
+	cleaned := d.CleanupOnBoot(localDomains, nil)
+	if cleaned != 1 {
+		t.Fatalf("expected 1 cleaned (re-key only), got %d", cleaned)
+	}
+	if d.CountSHIP() != 1 {
+		t.Fatalf("expected 1 remaining (fresh remote), got %d", d.CountSHIP())
+	}
+}
+
 // --- SLAP ---
 
 func TestAddAndLookupSLAPProvider(t *testing.T) {
@@ -176,6 +257,70 @@ func TestDiscovererProcessSLAPScript(t *testing.T) {
 	providers, _ := d.LookupSLAPByDomain("provider.example.com")
 	if len(providers) != 1 {
 		t.Fatalf("expected 1 provider, got %d", len(providers))
+	}
+}
+
+// --- Re-key dedup ---
+
+func TestSHIPGossipDedupOnRekey(t *testing.T) {
+	d := tmpDirectory(t)
+
+	// Old identity registers for a domain+topic
+	oldIdentity := "aaaa111111111111111111111111111111111111111111111111111111111111aa"
+	d.AddSHIPPeerFromGossip(oldIdentity, "node.example.com", "MyNode", "0.4.0", "anvil:mainnet")
+
+	if d.CountSHIP() != 1 {
+		t.Fatalf("expected 1 entry, got %d", d.CountSHIP())
+	}
+
+	// New identity registers same domain+topic (node re-keyed)
+	newIdentity := "bbbb222222222222222222222222222222222222222222222222222222222222bb"
+	d.AddSHIPPeerFromGossip(newIdentity, "node.example.com", "MyNode", "0.5.0", "anvil:mainnet")
+
+	// Should have 1 entry, not 2 — old was cleaned up
+	if d.CountSHIP() != 1 {
+		t.Fatalf("expected 1 entry after re-key, got %d", d.CountSHIP())
+	}
+
+	peers, _ := d.LookupSHIPByTopic("anvil:mainnet")
+	if len(peers) != 1 {
+		t.Fatalf("expected 1 peer, got %d", len(peers))
+	}
+	if peers[0].IdentityPub != newIdentity {
+		t.Fatalf("expected new identity, got %s", peers[0].IdentityPub)
+	}
+	if peers[0].Version != "0.5.0" {
+		t.Fatalf("expected version 0.5.0, got %s", peers[0].Version)
+	}
+}
+
+func TestSHIPGossipNoDedupDifferentDomain(t *testing.T) {
+	d := tmpDirectory(t)
+
+	// Two different domains with different identities — both should stay
+	d.AddSHIPPeerFromGossip("aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aa", "node-a.com", "A", "0.5.0", "anvil:mainnet")
+	d.AddSHIPPeerFromGossip("bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bb", "node-b.com", "B", "0.5.0", "anvil:mainnet")
+
+	if d.CountSHIP() != 2 {
+		t.Fatalf("expected 2 entries, got %d", d.CountSHIP())
+	}
+}
+
+func TestSHIPGossipSameIdentitySameDomain(t *testing.T) {
+	d := tmpDirectory(t)
+
+	// Same identity re-registers — should overwrite, still 1 entry
+	identity := "cccc3333cccc3333cccc3333cccc3333cccc3333cccc3333cccc3333cccc3333cc"
+	d.AddSHIPPeerFromGossip(identity, "node.example.com", "MyNode", "0.4.0", "anvil:mainnet")
+	d.AddSHIPPeerFromGossip(identity, "node.example.com", "MyNode", "0.5.0", "anvil:mainnet")
+
+	if d.CountSHIP() != 1 {
+		t.Fatalf("expected 1 entry, got %d", d.CountSHIP())
+	}
+
+	peers, _ := d.LookupSHIPByTopic("anvil:mainnet")
+	if peers[0].Version != "0.5.0" {
+		t.Fatalf("expected updated version, got %s", peers[0].Version)
 	}
 }
 

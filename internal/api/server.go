@@ -137,6 +137,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /status", s.openRead(s.handleStatus))
 	s.mux.HandleFunc("GET /stats", s.openRead(s.handleStats))
 	s.mux.HandleFunc("GET /mesh/status", cors(s.handleMeshStatus))
+	s.mux.HandleFunc("GET /mesh/nodes", cors(s.handleMeshNodes))
 	s.mux.HandleFunc("GET /headers/tip", s.openRead(s.handleHeadersTip))
 	s.mux.HandleFunc("GET /tx/{txid}/beef", s.openRead(s.handleGetBEEF))
 	s.mux.HandleFunc("GET /data", s.openRead(s.handleQueryData))
@@ -187,7 +188,8 @@ func (s *Server) openRead(next http.HandlerFunc) http.HandlerFunc {
 func cors(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-App-Token, X-Anvil-Auth, X402-Proof, X-Bsv-Payment")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-App-Token, X-Anvil-Auth, X402-Proof, X-Bsv-Payment, X-Topics")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
