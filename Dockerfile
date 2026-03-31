@@ -7,8 +7,8 @@ WORKDIR /app
 ARG TARGETARCH=amd64
 RUN curl -fsSL -L \
     "https://github.com/BSVanon/Anvil/releases/download/v1.0.0/anvil-linux-${TARGETARCH}" \
-    -o /usr/local/bin/anvil \
-    && chmod +x /usr/local/bin/anvil
+    -o /app/anvil \
+    && chmod +x /app/anvil
 
 # Startup script: generate anvil.toml from env vars at runtime
 COPY docker-entrypoint.sh ./docker-entrypoint.sh
