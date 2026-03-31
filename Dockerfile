@@ -6,7 +6,7 @@ WORKDIR /app
 # Download pre-built Anvil v1.0.0 binary
 ARG TARGETARCH=amd64
 RUN curl -fsSL -L \
-    "https://github.com/BSVanon/Anvil/releases/download/v1.0.0/anvil-linux-${TARGETARCH}" \
+    "https://github.com/BSVanon/Anvil/releases/download/v1.0.1/anvil-linux-${TARGETARCH}" \
     -o /app/anvil \
     && chmod +x /app/anvil
 
