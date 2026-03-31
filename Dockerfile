@@ -1,13 +1,11 @@
-FROM golang:1.26-alpine AS builder
-RUN apk add --no-cache gcc musl-dev
-WORKDIR /src
-COPY . .
-RUN CGO_ENABLED=1 go build -o anvil ./cmd/anvil
-
 FROM alpine:3.19
-RUN apk add --no-cache ca-certificates
+RUN apk add --no-cache ca-certificates curl
+
 WORKDIR /app
-COPY --from=builder /src/anvil ./anvil
+
+# Download pre-built Anvil v1.0.0 binary (amd64)
+RUN curl -fsSL https://github.com/BSVanon/Anvil/releases/download/v1.0.0/anvil-linux-amd64 -o anvil \
+    && chmod +x anvil
 
 # Startup script: generate anvil.toml from env vars at runtime
 COPY docker-entrypoint.sh ./docker-entrypoint.sh
