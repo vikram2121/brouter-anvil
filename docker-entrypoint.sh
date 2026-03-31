@@ -19,7 +19,7 @@ public_url = "${PUBLIC_URL}"
 mesh_public_url = "${MESH_URL}"
 
 [identity]
-# wif set via ANVIL_IDENTITY_WIF env var
+wif = "${ANVIL_IDENTITY_WIF:-}"
 
 [mesh]
 seeds = ["wss://anvil.sendbsv.com/mesh"]
