@@ -3,10 +3,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 
 WORKDIR /app
 
-# Download pre-built Anvil v1.0.0 binary
+# Download pre-built Anvil binary
+ARG ANVIL_VERSION=v1.1.1
 ARG TARGETARCH=amd64
 RUN curl -fsSL -L \
-    "https://github.com/BSVanon/Anvil/releases/download/v1.0.1/anvil-linux-${TARGETARCH}" \
+    "https://github.com/BSVanon/Anvil/releases/download/${ANVIL_VERSION}/anvil-linux-${TARGETARCH}" \
     -o /app/anvil \
     && chmod +x /app/anvil
 
